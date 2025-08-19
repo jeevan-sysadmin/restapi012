@@ -4,7 +4,6 @@ const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
 const cors = require('cors');
 const mongoose = require('mongoose');
-const path = require('path'); // Add this for static file serving
 
 const app = express();
 const PORT = process.env.PORT || 3000;
@@ -69,23 +68,6 @@ const DailyLog = mongoose.model('DailyLog', new mongoose.Schema({
 // Middleware
 app.use(cors());
 app.use(express.json());
-
-// Serve static files if any (optional)
-app.use(express.static(path.join(__dirname, 'public')));
-
-// Add a root route handler to fix "Cannot GET /" error
-app.get('/', (req, res) => {
-    res.json({ 
-        status: 'success', 
-        message: 'ElderCare API Server is running',
-        endpoints: {
-            auth: ['/api/login', '/api/register', '/api/generate-token'],
-            vitals: ['/api/vitals/real-time', '/api/vitals/history'],
-            alerts: ['/api/alerts/fall'],
-            logs: ['/api/logs/daily', '/api/logs/update']
-        }
-    });
-});
 
 // Authentication Middleware
 const authenticateToken = (req, res, next) => {
@@ -335,21 +317,6 @@ app.post('/api/logs/update', authenticateToken, async (req, res) => {
         console.error('Update daily log error:', error);
         res.status(500).json({ status: 'error', message: 'Failed to update daily log' });
     }
-});
-
-// Handle 404 for all other routes
-app.use('*', (req, res) => {
-    res.status(404).json({ 
-        status: 'error', 
-        message: 'Endpoint not found',
-        availableEndpoints: {
-            root: 'GET /',
-            auth: ['POST /api/login', 'POST /api/register', 'POST /api/generate-token'],
-            vitals: ['POST /api/vitals/real-time', 'POST /api/vitals/history'],
-            alerts: ['POST /api/alerts/fall'],
-            logs: ['POST /api/logs/daily', 'POST /api/logs/update']
-        }
-    });
 });
 
 // Start server
