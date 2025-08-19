@@ -1,0 +1,358 @@
+require('dotenv').config();
+const express = require('express');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcryptjs');
+const cors = require('cors');
+const mysql = require('mysql2/promise');
+
+const app = express();
+const PORT = process.env.PORT || 3000;
+const SECRET_KEY = process.env.JWT_SECRET;
+const AUTH_KEY = process.env.AUTH_KEY;
+const TOKEN_EXPIRY = '5m';
+
+// Enhanced environment validation
+if (!SECRET_KEY) {
+  console.error('Missing JWT_SECRET in environment. Exiting.');
+  process.exit(1);
+}
+if (!AUTH_KEY) {
+  console.warn('No AUTH_KEY set in environment. Consider setting one to restrict token generation.');
+}
+
+// Improved database connection with MYSQL_URL support
+const pool = mysql.createPool(process.env.MYSQL_URL || {
+  host: process.env.DB_HOST || 'localhost',
+  user: process.env.DB_USER || 'root',
+  password: process.env.DB_PASSWORD || '',
+  database: process.env.DB_NAME || 'mydb',
+  waitForConnections: true,
+  connectionLimit: 10,
+  queueLimit: 0,
+  ssl: process.env.MYSQL_URL ? { rejectUnauthorized: false } : undefined
+});
+
+// Database connection test
+async function testConnection() {
+  try {
+    const conn = await pool.getConnection();
+    await conn.ping();
+    conn.release();
+    console.log('Database connected successfully');
+  } catch (err) {
+    console.error('Database connection failed:', err);
+    process.exit(1);
+  }
+}
+
+// Enhanced middleware
+app.use(cors({
+  origin: [
+    'http://localhost:3000',
+    process.env.FRONTEND_URL
+  ].filter(Boolean),
+  methods: ['GET', 'POST', 'PUT', 'DELETE'],
+  allowedHeaders: ['Content-Type', 'Authorization']
+}));
+
+app.use(express.json());
+
+// Authentication Middleware
+const authenticateToken = (req, res, next) => {
+  const authHeader = req.headers['authorization'] || '';
+  const token = authHeader.startsWith('Bearer ') ? authHeader.split(' ')[1] : authHeader || null;
+
+  if (!token) {
+    return res.status(401).json({ status: 'error', message: 'Token missing' });
+  }
+
+  jwt.verify(token, SECRET_KEY, (err, payload) => {
+    if (err) {
+      return res.status(403).json({ status: 'error', message: 'Invalid or expired token' });
+    }
+    req.user = payload;
+    next();
+  });
+};
+
+// Database initialization with retry logic
+async function initializeDatabase() {
+  let retries = 5;
+  while (retries > 0) {
+    try {
+      const connection = await pool.getConnection();
+      
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS Users (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          name VARCHAR(255) NOT NULL,
+          email VARCHAR(255) NOT NULL UNIQUE,
+          phone VARCHAR(20),
+          password VARCHAR(255) NOT NULL,
+          created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+      `);
+
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS Vitals (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          user_id INT NOT NULL,
+          heart_rate INT,
+          movement VARCHAR(255),
+          status VARCHAR(50),
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE
+        )
+      `);
+
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS FallAlerts (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          user_id INT NOT NULL,
+          type VARCHAR(50) DEFAULT 'fall',
+          location VARCHAR(255) DEFAULT 'unknown',
+          timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+          acknowledged BOOLEAN DEFAULT FALSE,
+          FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE
+        )
+      `);
+
+      await connection.query(`
+        CREATE TABLE IF NOT EXISTS DailyLogs (
+          id INT AUTO_INCREMENT PRIMARY KEY,
+          user_id INT NOT NULL,
+          date DATE NOT NULL,
+          activities TEXT,
+          notes TEXT,
+          mood VARCHAR(50),
+          FOREIGN KEY (user_id) REFERENCES Users(id) ON DELETE CASCADE,
+          UNIQUE KEY unique_user_date (user_id, date)
+        )
+      `);
+
+      connection.release();
+      console.log('Database tables initialized');
+      break;
+    } catch (error) {
+      retries--;
+      console.error(`Database initialization error (${retries} retries left):`, error);
+      if (retries === 0) {
+        console.error('Failed to initialize database after retries');
+        process.exit(1);
+      }
+      await new Promise(res => setTimeout(res, 5000));
+    }
+  }
+}
+
+// Health check endpoint
+app.get('/health', (req, res) => {
+  res.status(200).json({ status: 'healthy' });
+});
+
+// Token Generation API
+app.post('/api/generate-token', async (req, res) => {
+  const { userName, password, authKey, role } = req.body;
+
+  if (!userName || !password || !authKey) {
+    return res.status(400).json({ status: 'error', message: 'Missing required fields' });
+  }
+
+  if (AUTH_KEY && authKey !== AUTH_KEY) {
+    return res.status(403).json({ status: 'error', message: 'Invalid authKey' });
+  }
+
+  try {
+    const payload = { userName, role: role || 'user' };
+    const token = jwt.sign(payload, SECRET_KEY, { expiresIn: TOKEN_EXPIRY });
+    res.json({ status: 'success', data: token, expiresIn: TOKEN_EXPIRY });
+  } catch (error) {
+    console.error('Token generation error:', error);
+    res.status(500).json({ status: 'error', message: 'Token generation failed' });
+  }
+});
+
+// Login API
+app.post('/api/login', async (req, res) => {
+  const { email, password } = req.body;
+  if (!email || !password) {
+    return res.status(400).json({ status: 'error', message: 'Email and password required' });
+  }
+
+  try {
+    const [rows] = await pool.query('SELECT * FROM Users WHERE email = ?', [email]);
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'User not found' });
+    }
+
+    const user = rows[0];
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ status: 'error', message: 'Invalid credentials' });
+    }
+
+    const payload = { userId: user.id, email: user.email, role: 'user' };
+    const token = jwt.sign(payload, SECRET_KEY, { expiresIn: '1h' });
+
+    res.json({
+      status: 'success',
+      message: 'Login successful',
+      id: user.id,
+      name: user.name,
+      token
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ status: 'error', message: 'Server error' });
+  }
+});
+
+// Register API
+app.post('/api/register', async (req, res) => {
+  const { name, email, phone, password, confirmPassword } = req.body;
+
+  try {
+    if (!name || !email || !phone || !password || !confirmPassword) {
+      return res.status(400).json({ status: 'error', message: 'All fields are required' });
+    }
+
+    if (password !== confirmPassword) {
+      return res.status(400).json({ status: 'error', message: 'Passwords do not match' });
+    }
+
+    const [existingUsers] = await pool.query('SELECT * FROM Users WHERE email = ?', [email]);
+    if (existingUsers.length > 0) {
+      return res.status(400).json({ status: 'error', message: 'User already exists' });
+    }
+
+    const hashedPassword = await bcrypt.hash(password, 10);
+    const [result] = await pool.query(
+      'INSERT INTO Users (name, email, phone, password) VALUES (?, ?, ?, ?)',
+      [name, email, phone, hashedPassword]
+    );
+
+    res.json({
+      status: 'success',
+      message: 'User registered successfully',
+      userId: result.insertId
+    });
+  } catch (error) {
+    console.error('Registration error:', error);
+    res.status(500).json({ status: 'error', message: 'Registration failed' });
+  }
+});
+
+// Protected APIs
+app.post('/api/vitals/real-time', authenticateToken, async (req, res) => {
+  const { id } = req.body;
+  if (!id) return res.status(400).json({ status: 'error', message: 'user id required' });
+
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM Vitals WHERE user_id = ? ORDER BY timestamp DESC LIMIT 1',
+      [id]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'No vitals data found' });
+    }
+
+    res.json({
+      heartRate: rows[0].heart_rate,
+      movement: rows[0].movement,
+      status: rows[0].status,
+      timestamp: rows[0].timestamp
+    });
+  } catch (error) {
+    console.error('Vitals realtime error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch vitals' });
+  }
+});
+
+app.post('/api/vitals/history', authenticateToken, async (req, res) => {
+  const { startDate, endDate } = req.body;
+  if (!startDate || !endDate) {
+    return res.status(400).json({ status: 'error', message: 'startDate and endDate required' });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      'SELECT timestamp, heart_rate as heartRate FROM Vitals WHERE timestamp BETWEEN ? AND ? ORDER BY timestamp ASC',
+      [startDate, endDate]
+    );
+
+    res.json({ data: rows });
+  } catch (error) {
+    console.error('Vitals history error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch vitals history' });
+  }
+});
+
+app.post('/api/alerts/fall', authenticateToken, async (req, res) => {
+  const { userId, type, location, timestamp } = req.body;
+
+  if (!userId) return res.status(400).json({ status: 'error', message: 'userId is required' });
+
+  try {
+    const [result] = await pool.query(
+      'INSERT INTO FallAlerts (user_id, type, location, timestamp) VALUES (?, ?, ?, ?)',
+      [userId, type || 'fall', location || 'unknown', timestamp || new Date()]
+    );
+
+    const [newAlert] = await pool.query('SELECT * FROM FallAlerts WHERE id = ?', [result.insertId]);
+    res.json({ status: 'success', alert: newAlert[0] });
+  } catch (error) {
+    console.error('Fall alert error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to create alert' });
+  }
+});
+
+app.post('/api/logs/daily', authenticateToken, async (req, res) => {
+  const { userId, date } = req.body;
+  if (!userId || !date) {
+    return res.status(400).json({ status: 'error', message: 'userId and date required' });
+  }
+
+  try {
+    const [rows] = await pool.query(
+      'SELECT * FROM DailyLogs WHERE user_id = ? AND date = ?',
+      [userId, date]
+    );
+
+    if (rows.length === 0) {
+      return res.status(404).json({ status: 'error', message: 'No logs found for this date' });
+    }
+
+    res.json(rows[0]);
+  } catch (error) {
+    console.error('Daily logs error:', error);
+    res.status(500).json({ status: 'error', message: 'Failed to fetch daily logs' });
+  }
+});
+
+// Error handling middleware
+app.use((err, req, res, next) => {
+  console.error(err.stack);
+  res.status(500).json({ status: 'error', message: 'Internal server error' });
+});
+
+// Database initialization and server start
+async function startServer() {
+  try {
+    await testConnection();
+    await initializeDatabase();
+    
+    if (require.main === module) {
+      app.listen(PORT, () => {
+        console.log(`Server running on http://localhost:${PORT}`);
+      });
+    }
+  } catch (error) {
+    console.error('Failed to start server:', error);
+    process.exit(1);
+  }
+}
+
+startServer();
+
+module.exports = app;
